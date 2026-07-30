@@ -57,6 +57,13 @@ runs:
             "kernel/prebuilts/build-tools": "build-tools",
             "AnyKernel3": "AnyKernel3"
         }
+        # Keep Infinity-X usable before its large pinned archives are mirrored
+        # to the release cache. These revisions match build-infinity-x-local.sh.
+        INFINITY_X_DIRECT_TOOLCHAIN_REFS = {
+            "build-tools": "434f141b6d22a773a163fa9c707b19b4d254d989",
+            "AnyKernel3": "0b46673ae91aee8d60bd6ee257b4d56d3f6a0114"
+        }
+        is_infinity_x = os.environ.get("OP_MODEL") == "OP-ACE-6-INFINITY-X"
         DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
         aria_quiet_flags = "--quiet --summary-interval=0" if not DEBUG else ""
         
@@ -139,7 +146,13 @@ runs:
                                 os.remove(input_file_path)
                                 found_in_cache = True
                             
-                        if not found_in_cache:
+                        if not found_in_cache and is_infinity_x and \
+                                INFINITY_X_DIRECT_TOOLCHAIN_REFS.get(label) == rev:
+                            print(
+                                "Infinity-X cache miss; fetching pinned source archive: "
+                                f"{base_filename}"
+                            )
+                        elif not found_in_cache:
                             print(f"::error::[FATAL ERROR] Toolchain {base_filename} NOT FOUND in GitHub Release cache!")
                             print(f"::error::[FATAL ERROR] Please Run Mirror Toolchain Workflow or select sync toolchain during build!!!")
                             return False
