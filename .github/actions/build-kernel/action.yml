@@ -355,6 +355,16 @@ runs:
         github_token: ${{ inputs.github_token }}
         debug: ${{ inputs.debug }}
 
+    - name: Fix Infinity-X PKCS#11 certificate tool
+      if: ${{ env.OP_MODEL == 'OP-ACE-6-INFINITY-X' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        source="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/certs/extract-cert.c"
+        test -f "$source"
+        test "$(grep -c '^#ifdef USE_PKCS11_ENGINE$' "$source")" -eq 2
+        sed -i '/^#ifdef USE_PKCS11_ENGINE$/,/^#endif$/ { /^#ifdef USE_PKCS11_ENGINE$/d; /^#endif$/d; }' "$source"
+
     - name: Set Dir Paths
       shell: bash
       run: |
