@@ -64,6 +64,7 @@ runs:
             "AnyKernel3": "0b46673ae91aee8d60bd6ee257b4d56d3f6a0114"
         }
         is_infinity_x = os.environ.get("OP_MODEL") == "OP-ACE-6-INFINITY-X"
+        INFINITY_X_MODULES_PATH = "kernel_platform/sm8750-modules"
         DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
         aria_quiet_flags = "--quiet --summary-interval=0" if not DEBUG else ""
         
@@ -209,6 +210,9 @@ runs:
         for project in root.findall('project'):
             name = project.get('name')
             path = project.get('path', name)
+            if is_infinity_x and name == "android_kernel_oneplus_sm8750-modules":
+                # The common kernel's drivers/base symlinks resolve here.
+                path = INFINITY_X_MODULES_PATH
             remote_name = project.get('remote', def_remote)
             rev = project.get('revision', def_rev)
             base_url = remotes.get(remote_name)
