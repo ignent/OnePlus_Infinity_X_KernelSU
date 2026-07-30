@@ -28,12 +28,24 @@ on:
           - android14-6.1
           - android13-5.15
           - android12-5.10
+          - Infinity-X
         default: A14+15+16
       ksu_options:
         description: 'Enter KernelSU build json'
         required: true
         type: string
         default: '[{"type":"ksun","hash":"dev"}]'
+      infinity_x_root_impl:
+        description: 'Infinity-X root implementation'
+        required: true
+        type: choice
+        options: [resuki, ksu, ksun, sukisu-ultra]
+        default: resuki
+      infinity_x_root_ref:
+        description: 'Infinity-X root branch, tag, or commit (empty uses the implementation default)'
+        required: false
+        type: string
+        default: ''
       optimize_level:
         description: "Compiler optimization level"
         required: true
@@ -92,6 +104,7 @@ jobs:
       susfs_hash_android15_6_6:  ${{ steps.set-matrix.outputs.susfs_hash_android15_6_6 }}
       susfs_hash_android16_6_12: ${{ steps.set-matrix.outputs.susfs_hash_android16_6_12 }}
       ksu_resolved_hash:    ${{ steps.set-matrix.outputs.ksu_resolved_hash }}
+      infinity_x_root_resolved_hash: ${{ steps.set-matrix.outputs.infinity_x_root_resolved_hash }}
       ksu_options_normalized: ${{ steps.set-matrix.outputs.ksu_options_normalized }}
       susfs_base_version: ${{ steps.set-matrix.outputs.susfs_base_version }}
     env:
@@ -114,6 +127,13 @@ jobs:
           
           input="${{ github.event.inputs.op_model }}"
           ksu_options_raw='${{ github.event.inputs.ksu_options }}'
+          infinity_x_root_impl="${{ inputs.infinity_x_root_impl }}"
+          infinity_x_root_ref="${{ inputs.infinity_x_root_ref }}"
+          if [ "$input" = "Infinity-X" ]; then
+            # Infinity-X has one independently selected root implementation.
+            # Keep the legacy resolver satisfied without expanding this target.
+            ksu_options_raw='[{"type":"ksu","hash":"main"}]'
+          fi
           if ! ksu_options_normalized=$(echo "$ksu_options_raw" | jq -c 'map(if .type then .type |= ascii_upcase | if .hash == null then if .type == "KSUN" then .hash = "dev" elif .type == "KSU" then .hash = "main" else .hash end else . end else error("No type found") end)' 2>&1); then
             echo "::error::ksu_options validation failed: $ksu_options_normalized"
             exit 1
@@ -157,20 +177,26 @@ jobs:
             android*-*.*)
               # Extract android version and kernel version
               IFS='-' read -r av kv <<< "$input"
-              
+
               # Build android*-* only for A15 and A16
               jq_filter="map(select(.os_version == \"A15\" or .os_version == \"A16\")) | map(select(.android_version == \"$av\" and .kernel_version == \"$kv\"))"
-              
+
               echo "ℹ️  Android-Kernel filter applied: $av-$kv"
               echo "   Restricted to: A15 and A16 only"
+              ;;
+            Infinity-X)
+              jq_filter='map(select(.model == "OP-ACE-6-INFINITY-X"))'
               ;;
             *)
               echo "::warning::Unknown input '$input'. Using empty filter."
               jq_filter="map(select(false))"
               ;;
           esac
-          
+
           filtered=$(jq -c "$jq_filter" matrix.json)
+          if [ "$input" != "Infinity-X" ]; then
+            filtered=$(echo "$filtered" | jq 'map(select(.model != "OP-ACE-6-INFINITY-X"))')
+          fi
           count=$(jq 'length' <<<"$filtered")
           
           filtered=$(echo "$filtered" | jq '
@@ -209,19 +235,22 @@ jobs:
           
           ksu_type=$(echo "$ksu_options_normalized" | jq -r '.[0].type')
           ksu_ref=$(echo "$ksu_options_normalized" | jq -r '.[0].hash')
-          
-          if [ "$ksu_type" == "KSUN" ]; then
-            KSU_REPO_OWNER="KernelSU-Next"
-            KSU_REPO_NAME="KernelSU-Next"
+          if [ "$input" = "Infinity-X" ]; then
+            resolved_sha="not-applicable"
+            echo "ksu_resolved_hash=$resolved_sha" >> "$GITHUB_OUTPUT"
           else
-            KSU_REPO_OWNER="tiann"
-            KSU_REPO_NAME="KernelSU"
-          fi
+            if [ "$ksu_type" == "KSUN" ]; then
+              KSU_REPO_OWNER="KernelSU-Next"
+              KSU_REPO_NAME="KernelSU-Next"
+            else
+              KSU_REPO_OWNER="tiann"
+              KSU_REPO_NAME="KernelSU"
+            fi
           
-          HEAD_REF="refs/heads/${ksu_ref}"
-          TAG_REF="refs/tags/${ksu_ref}"
+            HEAD_REF="refs/heads/${ksu_ref}"
+            TAG_REF="refs/tags/${ksu_ref}"
           
-          QUERY='query($owner: String!, $name: String!, $headRef: String!, $tagRef: String!, $objRef: String!) {
+            QUERY='query($owner: String!, $name: String!, $headRef: String!, $tagRef: String!, $objRef: String!) {
             repository(owner: $owner, name: $name) {
               hb: ref(qualifiedName: $headRef) { t: target { ... on Commit { o: oid } } }
               ht: ref(qualifiedName: $tagRef) { t: target { ... on Commit { o: oid } } }
@@ -229,43 +258,93 @@ jobs:
             }
           }'
           
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          RETRY_DELAY=5 # Seconds to wait between retries
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            RETRY_DELAY=5 # Seconds to wait between retries
           
-          echo "Resolving $ksu_type hash ($ksu_ref)..."
+            echo "Resolving $ksu_type hash ($ksu_ref)..."
           
-          until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
-            RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null)
-            EXIT_CODE=$?
-            
-            if [ $EXIT_CODE -eq 0 ] && [ ! -z "$RESULT" ]; then
-              echo "  ✅ API Success"
-              break
+            until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+              RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null)
+              EXIT_CODE=$?
+
+              if [ $EXIT_CODE -eq 0 ] && [ ! -z "$RESULT" ]; then
+                echo "  ✅ API Success"
+                break
+              fi
+
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "::warning::API failed (Attempt $RETRY_COUNT/$MAX_RETRIES). Retrying in ${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+            done
+
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "::error::GitHub API unreachable. Cannot validate $ksu_ref"
+              exit 1
             fi
-            
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            echo "::warning::API failed (Attempt $RETRY_COUNT/$MAX_RETRIES). Retrying in ${RETRY_DELAY}s..."
-            sleep $RETRY_DELAY
-          done
           
-          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-            echo "::error::GitHub API unreachable. Cannot validate $ksu_ref"
-            exit 1
+            resolved_sha=$(echo "$RESULT" | jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "unknown")')
+          
+            if [ "$resolved_sha" == "unknown" ]; then
+              echo "::error::Ref/Hash '$ksu_ref' does not exist in $KSU_REPO_OWNER/$KSU_REPO_NAME"
+              exit 1
+            fi
+          
+              echo "  ✅ Resolved: $ksu_type/$ksu_ref → $resolved_sha"
+              echo "ksu_resolved_hash=$resolved_sha" >> "$GITHUB_OUTPUT"
           fi
-          
-          resolved_sha=$(echo "$RESULT" | jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "unknown")')
-          
-          if [ "$resolved_sha" == "unknown" ]; then
-            echo "::error::Ref/Hash '$ksu_ref' does not exist in $KSU_REPO_OWNER/$KSU_REPO_NAME"
-            exit 1
-          fi
-          
-          echo "  ✅ Resolved: $ksu_type/$ksu_ref → $resolved_sha"
-          echo "ksu_resolved_hash=$resolved_sha" >> "$GITHUB_OUTPUT"
           
           # Inject ksu_resolved_hash into each device in the matrix
           merged_matrix=$(echo "$merged_matrix" | jq  --arg resolved_sha "$resolved_sha" 'map(.ksu_resolved_hash = $resolved_sha)')
+
+          if [ "$input" = "Infinity-X" ]; then
+            case "$infinity_x_root_impl" in
+              resuki)
+                root_owner="ReSukiSU"
+                root_repo="ReSukiSU"
+                root_default_ref="main"
+                ;;
+              ksu)
+                root_owner="tiann"
+                root_repo="KernelSU"
+                root_default_ref="main"
+                ;;
+              ksun)
+                root_owner="KernelSU-Next"
+                root_repo="KernelSU-Next"
+                root_default_ref="dev"
+                ;;
+              sukisu-ultra)
+                root_owner="SukiSU-Ultra"
+                root_repo="SukiSU-Ultra"
+                root_default_ref="main"
+                ;;
+              *)
+                echo "::error::Unsupported Infinity-X root implementation: $infinity_x_root_impl"
+                exit 1
+                ;;
+            esac
+
+            root_ref="${infinity_x_root_ref:-$root_default_ref}"
+            root_resolved_hash=$(gh api "repos/$root_owner/$root_repo/commits/$root_ref" --jq .sha)
+            if [[ ! "$root_resolved_hash" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Could not resolve Infinity-X $infinity_x_root_impl ref '$root_ref'"
+              exit 1
+            fi
+            echo "✅ Resolved Infinity-X $infinity_x_root_impl/$root_ref → $root_resolved_hash"
+            echo "infinity_x_root_resolved_hash=$root_resolved_hash" >> "$GITHUB_OUTPUT"
+            merged_matrix=$(echo "$merged_matrix" | jq \
+              --arg root_impl "$infinity_x_root_impl" \
+              --arg root_ref "$root_resolved_hash" \
+              'map(. + {root_impl: $root_impl, root_ref: $root_ref})')
+          fi
+
+          if [ "$input" = "Infinity-X" ] && [ "$infinity_x_root_impl" = "sukisu-ultra" ]; then
+            # SukiSU-Ultra is intentionally built without SUSFS.  Set the
+            # effective matrix value before the resolver or composite action
+            # can download, patch, or configure it.
+            merged_matrix=$(echo "$merged_matrix" | jq 'map(.susfs = false)')
+          fi
           
           # SUSFS hash fetch
           SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
@@ -320,7 +399,7 @@ jobs:
             until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
               RESPONSE=$(curl -s --fail -G "https://gitlab.com/api/graphql" --data-urlencode "query=$GL_QUERY")
               EXIT_CODE=$?
-              
+
               if [ $EXIT_CODE -eq 0 ] && [ -n "$RESPONSE" ]; then
                 resolved=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty')
                 if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
@@ -335,7 +414,7 @@ jobs:
                   break
                 fi
               fi
-              
+
               RETRY_COUNT=$((RETRY_COUNT + 1))
               echo "::warning::GitLab GraphQL API failed (Attempt $RETRY_COUNT/$MAX_RETRIES). Retrying..."
               sleep $RETRY_DELAY
@@ -370,28 +449,32 @@ jobs:
           
           # SUSFS_VERSION — only when releasing
           if [ "${{ inputs.make_release }}" = "true" ]; then
-            susfs_base_version="unknown"
-            for key in "${active_keys[@]}"; do
-              ver="${susfs_versions_per_key[$key]:-unknown}"
-              if [ "$ver" != "unknown" ]; then
-                susfs_base_version="$ver"
-                break
-              fi
-            done
-            
-            if [ "$susfs_base_version" = "unknown" ]; then
-              echo "::error::Could not extract SUSFS_VERSION from susfs.h for any active GKI key. Cannot proceed with release."
-              exit 1
-            fi
-            
-            # make_release=true: mismatch is a hard error — prevents wrong tag
-            for key in "${active_keys[@]}"; do
-              key_ver="${susfs_versions_per_key[$key]:-unknown}"
-              if [ "$key_ver" != "$susfs_base_version" ]; then
-                echo "::error::SUSFS version mismatch: '$key' has '$key_ver', expected '$susfs_base_version'. Align refs before releasing."
+            if [ "${#active_keys[@]}" -eq 0 ]; then
+              susfs_base_version="none"
+            else
+              susfs_base_version="unknown"
+              for key in "${active_keys[@]}"; do
+                ver="${susfs_versions_per_key[$key]:-unknown}"
+                if [ "$ver" != "unknown" ]; then
+                  susfs_base_version="$ver"
+                  break
+                fi
+              done
+
+              if [ "$susfs_base_version" = "unknown" ]; then
+                echo "::error::Could not extract SUSFS_VERSION from susfs.h for any active GKI key. Cannot proceed with release."
                 exit 1
               fi
-            done
+
+              # make_release=true: mismatch is a hard error — prevents wrong tag
+              for key in "${active_keys[@]}"; do
+                key_ver="${susfs_versions_per_key[$key]:-unknown}"
+                if [ "$key_ver" != "$susfs_base_version" ]; then
+                  echo "::error::SUSFS version mismatch: '$key' has '$key_ver', expected '$susfs_base_version'. Align refs before releasing."
+                  exit 1
+                fi
+              done
+            fi
             
             echo "susfs_base_version=$susfs_base_version" >> "$GITHUB_OUTPUT"
           fi
@@ -448,13 +531,21 @@ jobs:
         run: |
           ksu_type="${{ fromJSON(steps.set-matrix.outputs.ksu_options_normalized)[0].type }}"
           ksu_ref="${{ fromJSON(steps.set-matrix.outputs.ksu_options_normalized)[0].hash }}"
+          ksu_resolved_hash="${{ steps.set-matrix.outputs.ksu_resolved_hash }}"
+          if [ "${{ inputs.op_model }}" = "Infinity-X" ]; then
+            ksu_type=$(echo "${{ inputs.infinity_x_root_impl }}" | tr '[:lower:]-' '[:upper:]_')
+            ksu_ref="${{ inputs.infinity_x_root_ref }}"
+            ksu_resolved_hash="${{ steps.set-matrix.outputs.infinity_x_root_resolved_hash }}"
+          fi
           
           ksu_display=""
-          if [ "$ksu_type" = "KSUN" ] || [ "$ksu_type" = "KSU" ]; then
-            if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
-              ksu_display+="📌 \`$ksu_type\`, \`$ksu_ref\`"
+          if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            ksu_display+="📌 \`$ksu_type\`, \`$ksu_ref\`"
+          else
+            if [ -n "$ksu_resolved_hash" ]; then
+              ksu_display+="🔀 \`$ksu_type\`, \`${ksu_ref:-default}\` (\`$ksu_resolved_hash\`)"
             else
-              ksu_display+="🔀 \`$ksu_type\`, \`$ksu_ref\` (\`${{ steps.set-matrix.outputs.ksu_resolved_hash }}\`)"
+              ksu_display+="📌 \`$ksu_type\`"
             fi
           fi
           
@@ -475,7 +566,7 @@ jobs:
           **Configuration:**
           EOF
           
-            echo "- KSU Config: $ksu_display"
+            echo "- Root Config: $ksu_display"
             echo "- Build Timestamp: $build_ts_display"
           
             cat << 'EOF'
@@ -579,7 +670,7 @@ jobs:
           if-no-files-found: warn
 
   build:
-    name: build (${{ matrix.model }}, ${{ matrix.soc }}, ${{ matrix.branch }}, ${{ matrix.manifest }}, ${{ matrix.android_version }}, ${{ matrix.kernel_version }}, ${{ matrix.os_version }}, ${{ matrix.ksu_type }})
+    name: build (${{ matrix.model }}, ${{ matrix.soc }}, ${{ matrix.branch }}, ${{ matrix.manifest }}, ${{ matrix.android_version }}, ${{ matrix.kernel_version }}, ${{ matrix.os_version }}, ${{ matrix.root_impl || matrix.ksu_type }})
     needs: [set-op-model, mirror_toolchain, prepare_ccache]
     if: |
       !cancelled() &&
@@ -688,7 +779,7 @@ jobs:
         id: prepare_config
         shell: bash
         run: |
-          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_hash, .ksu_resolved_hash)')" >> "$GITHUB_OUTPUT"
+          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_hash, .ksu_resolved_hash, .root_impl, .root_ref)')" >> "$GITHUB_OUTPUT"
 
       - name: 🔨 Build Kernel
         id: build
@@ -697,6 +788,8 @@ jobs:
           op_config_json: ${{ steps.prepare_config.outputs.config_json }}
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
+          root_impl: ${{ matrix.root_impl }}
+          root_ref: ${{ matrix.root_ref }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
           optimize_level: ${{ inputs.optimize_level }}
           build_timestamp: ${{ inputs.build_timestamp }}
@@ -724,14 +817,21 @@ jobs:
             echo ""
             echo "Outputs:"
             echo "  - Kernel: ${{ steps.build.outputs.kernel_version }}"
-            if [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
-              echo "  - KSU Next: v${{ steps.build.outputs.ksu_version }}"
+            root_impl="${{ steps.build.outputs.ksu_type }}"
+            if [ "$root_impl" = "RESUKI" ] || [ "$root_impl" = "SUKISU_ULTRA" ]; then
+              echo "  - $root_impl revision: ${{ steps.build.outputs.ksu_version }}"
+            else
+              echo "  - $root_impl: v${{ steps.build.outputs.ksu_version }}"
+            fi
+            if [ "$root_impl" = "KSUN" ]; then
               echo "ksun_ver=${{ steps.build.outputs.ksu_version }}" >> "$GITHUB_OUTPUT"
               echo "ksu_ver=" >> "$GITHUB_OUTPUT"
-            else
-              echo "  - KSU: v${{ steps.build.outputs.ksu_version }}"
+            elif [ "$root_impl" = "KSU" ]; then
               echo "ksun_ver=" >> "$GITHUB_OUTPUT"
               echo "ksu_ver=${{ steps.build.outputs.ksu_version }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "ksun_ver=" >> "$GITHUB_OUTPUT"
+              echo "ksu_ver=" >> "$GITHUB_OUTPUT"
             fi
             if [ "${{ matrix.susfs }}" = true ]; then
               echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
@@ -776,14 +876,11 @@ jobs:
           |--------|-------|
           | **Kernel** | ${{ steps.build.outputs.kernel_version }} |
           EOF
-            if [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
-              cat >> $GITHUB_STEP_SUMMARY << EOF
-          | **KSU Next** | v${{ steps.build.outputs.ksu_version }} |
-          EOF
+            root_impl="${{ steps.build.outputs.ksu_type }}"
+            if [ "$root_impl" = "RESUKI" ] || [ "$root_impl" = "SUKISU_ULTRA" ]; then
+              echo "| **$root_impl Revision** | ${{ steps.build.outputs.ksu_version }} |" >> "$GITHUB_STEP_SUMMARY"
             else
-              cat >> $GITHUB_STEP_SUMMARY << EOF
-          | **KSU** | v${{ steps.build.outputs.ksu_version }} |
-          EOF
+              echo "| **$root_impl** | v${{ steps.build.outputs.ksu_version }} |" >> "$GITHUB_STEP_SUMMARY"
             fi
             
             if [ "${{ matrix.susfs }}" = true ]; then
@@ -853,7 +950,7 @@ jobs:
       REPO_NAME: ${{ github.event.repository.name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
-      RELEASE_NAME: '*TEST BUILD* OnePlus Kernels With KernelSU Next & SUSFS ${{ needs.set-op-model.outputs.susfs_base_version }} *TEST BUILD*'
+      RELEASE_NAME: '*TEST BUILD* OnePlus Kernels With Root & SUSFS ${{ needs.set-op-model.outputs.susfs_base_version }} *TEST BUILD*'
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v6
@@ -906,15 +1003,28 @@ jobs:
               zipname=$(basename "$file" .zip)
               rest="${zipname#AK3_}"
               IFS='_' read -ra parts <<< "$rest"
-              model="${parts[0]}"
-              os_version="${parts[1]}"
-              kernel_version="${parts[2]}"
-              ksu_type="${parts[3]}"
-              ksu_ver="${parts[4]}"
-              if [ "${parts[5]:-}" = "SuSFS" ]; then
-                susfs_ver="${parts[6]:-unknown}"
+              if [[ "${parts[1]:-}" == "Infinity-X" ]]; then
+                model="OP-ACE-6-INFINITY-X"
+                os_version="A16"
+                kernel_version="${parts[0]}"
+                ksu_type="${parts[2]}"
+                ksu_ver="${parts[3]}"
+                if [ "${parts[4]:-}" = "SuSFS" ]; then
+                  susfs_ver="${parts[5]:-unknown}"
+                else
+                  susfs_ver="none"
+                fi
               else
-                susfs_ver="none"
+                model="${parts[0]}"
+                os_version="${parts[1]}"
+                kernel_version="${parts[2]}"
+                ksu_type="${parts[3]}"
+                ksu_ver="${parts[4]}"
+                if [ "${parts[5]:-}" = "SuSFS" ]; then
+                  susfs_ver="${parts[6]:-unknown}"
+                else
+                  susfs_ver="none"
+                fi
               fi
               full_model="${model}_${os_version}_${kernel_version}"
               device_info["$full_model"]="$model|$os_version|$kernel_version|$ksu_type|$ksu_ver|$susfs_ver|$zipname"
@@ -924,6 +1034,11 @@ jobs:
           ksu_type="${{ fromJSON(needs.set-op-model.outputs.ksu_options_normalized)[0].type }}"
           ksu_ref="${{ fromJSON(needs.set-op-model.outputs.ksu_options_normalized)[0].hash }}"
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
+          if [ "${{ inputs.op_model }}" = "Infinity-X" ]; then
+            ksu_type=$(echo "${{ inputs.infinity_x_root_impl }}" | tr '[:lower:]-' '[:upper:]_')
+            ksu_ref="${{ inputs.infinity_x_root_ref }}"
+            ksu_resolved_hash="${{ needs.set-op-model.outputs.infinity_x_root_resolved_hash }}"
+          fi
           
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
           CLEAN_BUILD="${{ inputs.clean_build }}"
@@ -942,7 +1057,7 @@ jobs:
             <<< "${{ needs.set-op-model.outputs.active_gki_keys }}"
           
           cat << EOF > release_notes.md
-          # 🎯 OnePlus Kernels with KernelSU Next & SUSFS $SUSFS_BASE_VERSION
+          # 🎯 OnePlus Kernels with Root & SUSFS $SUSFS_BASE_VERSION
           
           > **Build Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')  
           > **Build ID:** \`${{ github.run_id }}\`  
@@ -1067,6 +1182,16 @@ jobs:
           | **KernelSU Branch** | \`$ksu_display\` |
           | **KernelSU Version** | \`$ksu_ver_global\` |
           EOF
+          elif [ "$ksu_type" == "RESUKI" ]; then
+            cat << EOF >> release_notes.md
+          | **ReSukiSU Branch** | \`$ksu_display\` |
+          | **ReSukiSU Revision** | \`$ksu_ver_global\` |
+          EOF
+          elif [ "$ksu_type" == "SUKISU_ULTRA" ]; then
+            cat << EOF >> release_notes.md
+          | **SukiSU-Ultra Branch** | \`$ksu_display\` |
+          | **SukiSU-Ultra Revision** | \`$ksu_ver_global\` |
+          EOF
           else
             cat << EOF >> release_notes.md
           | **Unknown KernelSU Fork Branch** | \`\` |
@@ -1101,16 +1226,24 @@ jobs:
             cat << EOF >> release_notes.md
           - **KernelSU** - Kernel-level root solution
           EOF
+          elif [ "$ksu_type" == "RESUKI" ]; then
+            cat << EOF >> release_notes.md
+          - **ReSukiSU** - Kernel-level root solution
+          EOF
+          elif [ "$ksu_type" == "SUKISU_ULTRA" ]; then
+            cat << EOF >> release_notes.md
+          - **SukiSU-Ultra** - Kernel-level root solution with KPM
+          EOF
           fi
           cat << EOF >> release_notes.md
           - **SUSFS $SUSFS_BASE_VERSION** - Advanced hiding and security features
           EOF
-          if [ "$ksu_type" == "KSUN" ] && [ "${ksu_ver_global:-0}" -lt 12884 ]; then
+          if [ "$ksu_type" == "KSUN" ] && [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "$ksu_ver_global" -lt 12884 ]; then
             cat << EOF >> release_notes.md
           - **Magic Mount Support** - Seamless file system modifications
           EOF
           fi
-          if [ "${ksu_ver_global:-0}" -lt 12884 ]; then
+          if [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "$ksu_ver_global" -lt 12884 ]; then
             cat << EOF >> release_notes.md
           - **Manual Hooks** - scope_min_manual_hooks_v1.4 for better compatibility
           EOF
@@ -1164,6 +1297,16 @@ jobs:
           - **KernelSU Manager**  
             → [GitHub Release](https://github.com/tiann/KernelSU/releases)
           EOF
+          elif [ "$ksu_type" == "RESUKI" ]; then
+            cat << EOF >> release_notes.md
+          - **ReSukiSU Manager**
+            → [GitHub Release](https://github.com/ReSukiSU/ReSukiSU/releases)
+          EOF
+          elif [ "$ksu_type" == "SUKISU_ULTRA" ]; then
+            cat << EOF >> release_notes.md
+          - **SukiSU-Ultra Manager**
+            → [GitHub Release](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+          EOF
           fi
           cat << EOF >> release_notes.md
           ### Community Managers
@@ -1195,8 +1338,8 @@ jobs:
               c. **KSU GKI**: if you are 100% sure you already flashed stock init_boot/boot/vendor_boot, no action is needed; otherwise, follow the same steps as KSU LKM.
               d. **APatch**: remove /data/adb contents to avoid leftover root conflicts **after flashing the AnyKernel3 ZIP**.
           3. Flash the ZIP to the active slot using Kernel Flasher.
-          4. Install the KernelSU-Next Manager APK, same version as mentioned in the AnyKernel3 ZIP name.
-          5. Open the KernelSU-Next app.
+          4. Install the manager APK matching the root implementation shown in the AnyKernel3 ZIP name.
+          5. Open that manager app.
           6. Reboot the device if you performed any cleanup in step 2.
           
           ---
